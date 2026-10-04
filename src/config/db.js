@@ -4,14 +4,24 @@ require('dotenv').config();
 const connectionString = process.env.DATABASE_URL;
 
 if (!connectionString) {
-  console.error('DATABASE_URL is not defined in environment variables');
-  process.exit(1);
+  console.warn('⚠️ WARNING: DATABASE_URL is not defined in environment variables. Database operations will fail.');
 }
+
+const isProduction = process.env.NODE_ENV === 'production' || !!process.env.VERCEL;
+const isCloudUrl = connectionString && (
+  connectionString.includes('neon.tech') ||
+  connectionString.includes('supabase.co') ||
+  connectionString.includes('render.com') ||
+  connectionString.includes('railway.app') ||
+  connectionString.includes('sslmode=require') ||
+  connectionString.includes('pooler.supabase.com')
+);
+
+const useSsl = process.env.DB_SSL === 'true' || (isProduction && !connectionString?.includes('localhost')) || isCloudUrl;
 
 const pool = new Pool({
   connectionString,
-  // For local development, disable SSL or make it optional
-  ssl: process.env.DB_SSL === 'true' ? { rejectUnauthorized: false } : false
+  ssl: useSsl ? { rejectUnauthorized: false } : false
 });
 
 pool.on('connect', () => {
@@ -19,8 +29,11 @@ pool.on('connect', () => {
 });
 
 pool.on('error', (err) => {
-  console.error('Unexpected error on idle PostgreSQL client', err);
-  process.exit(-1);
+  console.error('Unexpected error on idle PostgreSQL client:', err.message);
+  // Do not exit process in serverless / Vercel
+  if (!process.env.VERCEL) {
+    // Only exit in standalone container/local environments if critical
+  }
 });
 
 module.exports = {

@@ -27,10 +27,34 @@ app.get('/health', (req, res) => {
   res.json({ status: 'healthy', timestamp: new Date() });
 });
 
+// Root status endpoint
+app.get('/', (req, res) => {
+  res.json({
+    name: 'DocuMind AI Backend API',
+    status: 'online',
+    version: '1.0.0',
+    documentation: '/health'
+  });
+});
+
+// Lazy DB initialization for serverless / Vercel
+let dbInitialized = false;
+app.use(async (req, res, next) => {
+  if (!dbInitialized && (process.env.VERCEL || process.env.NODE_ENV === 'production')) {
+    try {
+      await initDatabase();
+      dbInitialized = true;
+    } catch (err) {
+      console.error('Serverless DB auto-init warning:', err.message);
+    }
+  }
+  next();
+});
+
 // Global Error Handler
 app.use(errorHandler);
 
-// Initialize DB and start server
+// Initialize DB and start server (for local execution)
 async function startServer() {
   try {
     // Run migrations/table creation
@@ -47,4 +71,8 @@ async function startServer() {
   }
 }
 
-startServer();
+if (require.main === module) {
+  startServer();
+}
+
+module.exports = app;

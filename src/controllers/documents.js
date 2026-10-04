@@ -6,12 +6,26 @@ const pdfProcessor = require('../services/pdfProcessor');
 const ai = require('../services/ai');
 const vectorStore = require('../services/vectorStore');
 
-// Configure multer storage
+const os = require('os');
+
+// Configure multer storage (use os.tmpdir() on Vercel / serverless where filesystem is read-only)
+const getUploadDir = () => {
+  if (process.env.VERCEL || process.env.NODE_ENV === 'production') {
+    return path.join(os.tmpdir(), 'documind-uploads');
+  }
+  return path.join(__dirname, '..', '..', 'uploads');
+};
+
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
-    const uploadDir = path.join(__dirname, '..', '..', 'uploads');
+    const uploadDir = getUploadDir();
     if (!fs.existsSync(uploadDir)) {
-      fs.mkdirSync(uploadDir, { recursive: true });
+      try {
+        fs.mkdirSync(uploadDir, { recursive: true });
+      } catch (e) {
+        // Fallback directly to tmpdir if custom folder fails
+        return cb(null, os.tmpdir());
+      }
     }
     cb(null, uploadDir);
   },
