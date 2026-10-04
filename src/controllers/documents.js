@@ -25,7 +25,6 @@ const storage = multer.diskStorage({
 const upload = multer({
   storage: storage,
   fileFilter: (req, file, cb) => {
-    // Only accept PDFs
     const filetypes = /pdf/i;
     const mimetype = filetypes.test(file.mimetype);
     const extname = filetypes.test(path.extname(file.originalname).toLowerCase());
@@ -35,102 +34,128 @@ const upload = multer({
     }
     cb(new Error('Only PDF files are allowed!'));
   },
-  limits: { fileSize: 25 * 1024 * 1024 } // 25 MB limit
+  limits: { fileSize: 50 * 1024 * 1024 } // 50 MB limit
 }).single('file');
+
+/**
+ * Concurrency helper for rate-limited async batch processing.
+ */
+async function mapConcurrent(items, concurrency, fn) {
+  const results = [];
+  const executing = new Set();
+  
+  for (const item of items) {
+    const p = Promise.resolve().then(() => fn(item));
+    results.push(p);
+    executing.add(p);
+    
+    const clean = () => executing.delete(p);
+    p.then(clean).catch(clean);
+    
+    if (executing.size >= concurrency) {
+      await Promise.race(executing);
+    }
+  }
+  
+  return Promise.all(results);
+}
 
 // Asynchronous background processing pipeline
 async function runProcessingPipeline(documentId, filePath) {
   try {
-    console.log(`Starting background processing for document ID: ${documentId}, file: ${filePath}`);
+    console.log(`[Pipeline] Starting background processing for document ID: ${documentId}, file: ${filePath}`);
     
-    // 1. Extract text page-by-page
-    const pages = await pdfProcessor.extractTextFromPdf(filePath);
-    console.log(`Extracted ${pages.length} pages from PDF`);
+    // 1. PyMuPDF Extraction + Table Detection + Outline/TOC + Cleaning + Semantic Chunking
+    const extractedData = await pdfProcessor.extractAndChunkPdf(filePath);
+    const rawChunks = extractedData.chunks || [];
     
-    // 2. Chunk text and retain page numbers
-    const allChunks = [];
-    for (const page of pages) {
-      const pageText = page.text;
-      if (!pageText || pageText.trim() === '') continue;
-      
-      const textChunks = pdfProcessor.chunkText(pageText, 1000, 200);
-      for (const chunkText of textChunks) {
-        allChunks.push({
-          content: chunkText,
-          pageNumber: page.page
-        });
+    if (rawChunks.length === 0) {
+      throw new Error('No readable text or table content could be extracted from this PDF.');
+    }
+    
+    console.log(`[Pipeline] Generated ${rawChunks.length} semantic chunks (${extractedData.tables_detected || 0} tables, ${extractedData.pages_count || 0} pages).`);
+    
+    const allChunks = rawChunks.map((c, idx) => ({
+      chunk_index: c.chunk_index !== undefined ? c.chunk_index : idx,
+      content: c.content,
+      pageNumber: c.page || 1,
+      heading: c.heading || 'General Overview',
+      section_path: c.section_path || c.heading || 'General Overview',
+      content_type: c.content_type || 'text',
+      summary_hint: c.summary_hint || '',
+      metadata: { 
+        page: c.page || 1, 
+        heading: c.heading || 'General Overview',
+        section_path: c.section_path || c.heading || 'General Overview',
+        content_type: c.content_type || 'text'
       }
-    }
-    
-    if (allChunks.length === 0) {
-      throw new Error('No text content could be extracted from this PDF');
-    }
-    
-    console.log(`Generated ${allChunks.length} text chunks`);
-    
+    }));
+
     // Check if the document was cancelled/deleted during extraction
-    const docCheck = await db.query('SELECT id FROM documents WHERE id = $1', [documentId]);
+    const docCheck = await db.query('SELECT id, filename FROM documents WHERE id = $1', [documentId]);
     if (docCheck.rows.length === 0) {
-      console.log(`Document ID ${documentId} was cancelled. Aborting background processing.`);
+      console.log(`[Pipeline] Document ID ${documentId} was cancelled. Aborting background processing.`);
       return;
     }
-    
-    // 3. Batch generate embeddings in parallel using Promise.all
-    // We segment into batches of 100 chunks for efficiency
-    const batchSize = 100;
+    const docFilename = docCheck.rows[0].filename;
+
+    // 2. Batch generate embeddings with concurrency control
+    const batchSize = 40;
     const batches = [];
     for (let i = 0; i < allChunks.length; i += batchSize) {
       batches.push(allChunks.slice(i, i + batchSize));
     }
     
-    console.log(`Generating embeddings for ${batches.length} batches in parallel...`);
+    console.log(`[Pipeline] Generating embeddings for ${batches.length} batches with concurrency control...`);
     
-    const embeddingPromises = batches.map(async (batch, index) => {
-      const textsToEmbed = batch.map(c => c.content);
+    await mapConcurrent(batches, 3, async (batch) => {
+      // Contextualize text for embedding with Document and Section hierarchy
+      const textsToEmbed = batch.map(c => `[Document: ${docFilename}] [Section: ${c.section_path || c.heading}] ${c.content}`);
       const embeddings = await ai.getEmbeddings(textsToEmbed);
       
       for (let j = 0; j < batch.length; j++) {
         batch[j].embedding = embeddings[j];
       }
-      console.log(`Generated embeddings for batch ${index + 1}/${batches.length}`);
     });
     
-    await Promise.all(embeddingPromises);
-    
-    // Check if the document was cancelled/deleted during embedding generation
+    // Check if document cancelled during embedding
     const docCheck2 = await db.query('SELECT id FROM documents WHERE id = $1', [documentId]);
     if (docCheck2.rows.length === 0) {
-      console.log(`Document ID ${documentId} was cancelled during embedding. Aborting.`);
+      console.log(`[Pipeline] Document ID ${documentId} was cancelled during embedding. Aborting.`);
       return;
     }
     
-    // 4. Save chunks and embeddings to database
+    // 3. Save chunks, tsvector keyword index, and embeddings to pgvector / PostgreSQL
     await vectorStore.saveChunks(documentId, allChunks);
+
+    // 4. Generate and save executive document summary into PostgreSQL
+    try {
+      const summaryResult = await ai.generateDocumentSummary(allChunks, docFilename);
+      await vectorStore.saveDocumentSummary(documentId, summaryResult.summary, summaryResult.keyTakeaways);
+      console.log(`[Pipeline] Document summary generated and saved for ID: ${documentId}`);
+    } catch (sumErr) {
+      console.warn(`[Pipeline] Document summary generation warning for ID ${documentId}:`, sumErr.message);
+    }
     
     // 5. Update document status to processed
     await db.query(
       'UPDATE documents SET status = $1 WHERE id = $2',
       ['processed', documentId]
     );
-    console.log(`Document processing completed successfully for ID: ${documentId}`);
+    console.log(`[Pipeline] Document processing completed successfully for ID: ${documentId}`);
     
   } catch (error) {
-    // If the document was deleted mid-flight, exit cleanly
     const docExists = await db.query('SELECT id FROM documents WHERE id = $1', [documentId]);
     if (docExists.rows.length === 0) {
-      console.log(`Document ID ${documentId} was deleted/cancelled during processing. Pipeline exited cleanly.`);
+      console.log(`[Pipeline] Document ID ${documentId} was deleted/cancelled. Pipeline exited cleanly.`);
       return;
     }
     
-    console.error(`Failed to process document ID: ${documentId}. Error:`, error);
-    // Update document status to failed
+    console.error(`[Pipeline] Failed to process document ID: ${documentId}. Error:`, error);
     await db.query(
       'UPDATE documents SET status = $1 WHERE id = $2',
       ['failed', documentId]
     );
-  } finally {
-    // Delete file locally to save space if needed, or keep it.
-    // For MVP, we can keep it in backend/uploads for potential debugging or page re-renders.
   }
 }
 
@@ -150,7 +175,6 @@ function uploadDocument(req, res) {
     const filePath = req.file.path;
     
     try {
-      // Insert document record as 'processing'
       const insertResult = await db.query(
         'INSERT INTO documents (user_id, filename, file_path, status) VALUES ($1, $2, $3, $4) RETURNING *',
         [userId, filename, filePath, 'processing']
@@ -158,7 +182,7 @@ function uploadDocument(req, res) {
       
       const document = insertResult.rows[0];
       
-      // Trigger background processing (WITHOUT await, to return HTTP response immediately)
+      // Trigger background processing asynchronously
       runProcessingPipeline(document.id, filePath);
       
       return res.status(202).json({
@@ -168,7 +192,6 @@ function uploadDocument(req, res) {
       
     } catch (error) {
       console.error('Error inserting document record:', error);
-      // Clean up uploaded file if DB insert fails
       if (fs.existsSync(filePath)) {
         fs.unlinkSync(filePath);
       }
@@ -191,14 +214,17 @@ async function listDocuments(req, res, next) {
   }
 }
 
-// Controller to get details of a specific document
+// Controller to get details of a specific document (including executive summary if ready)
 async function getDocument(req, res, next) {
   const userId = req.user.id;
   const docId = req.params.id;
   
   try {
     const result = await db.query(
-      'SELECT id, filename, status, created_at FROM documents WHERE id = $1 AND user_id = $2',
+      `SELECT d.id, d.filename, d.status, d.created_at, ds.summary, ds.key_takeaways 
+       FROM documents d
+       LEFT JOIN document_summaries ds ON d.id = ds.document_id
+       WHERE d.id = $1 AND d.user_id = $2`,
       [docId, userId]
     );
     
@@ -218,7 +244,6 @@ async function deleteDocument(req, res, next) {
   const docId = req.params.id;
   
   try {
-    // Verify document exists and belongs to this user
     const selectResult = await db.query(
       'SELECT id, file_path FROM documents WHERE id = $1 AND user_id = $2',
       [docId, userId]
@@ -231,21 +256,106 @@ async function deleteDocument(req, res, next) {
     const doc = selectResult.rows[0];
     const filePath = doc.file_path;
     
-    // Delete from database (this will cascade delete chunks and chat history)
     await db.query('DELETE FROM documents WHERE id = $1', [docId]);
     
-    // Delete file from disk
     if (filePath && fs.existsSync(filePath)) {
       try {
         fs.unlinkSync(filePath);
-        console.log(`Unlinked file from disk: ${filePath}`);
       } catch (err) {
         console.error(`Failed to delete file from disk: ${filePath}. Error: ${err.message}`);
       }
     }
     
-    return res.json({ message: 'Document cancelled and deleted successfully' });
+    return res.json({ message: 'Document deleted successfully' });
   } catch (error) {
+    next(error);
+  }
+}
+
+// Controller to get or auto-generate concept graph for a document
+async function getConceptGraph(req, res, next) {
+  const userId = req.user.id;
+  const docId = req.params.id;
+
+  try {
+    const docRes = await db.query(
+      'SELECT id, filename, status, graph_data FROM documents WHERE id = $1 AND user_id = $2',
+      [docId, userId]
+    );
+
+    if (docRes.rows.length === 0) {
+      return res.status(404).json({ error: 'Document not found or unauthorized' });
+    }
+
+    const doc = docRes.rows[0];
+    if (doc.status !== 'processed') {
+      return res.status(400).json({ error: `Cannot generate concept graph for document in "${doc.status}" state.` });
+    }
+
+    if (doc.graph_data) {
+      return res.json({ graph: doc.graph_data, cached: true });
+    }
+
+    const chunksRes = await db.query(
+      'SELECT page_number, content FROM document_chunks WHERE document_id = $1 ORDER BY page_number ASC',
+      [docId]
+    );
+
+    if (chunksRes.rows.length === 0) {
+      return res.status(400).json({ error: 'No extracted text chunks found for this document.' });
+    }
+
+    const graphData = await ai.generateConceptGraph(chunksRes.rows, doc.filename);
+
+    await db.query(
+      'UPDATE documents SET graph_data = $1 WHERE id = $2',
+      [JSON.stringify(graphData), docId]
+    );
+
+    return res.json({ graph: graphData, cached: false });
+
+  } catch (error) {
+    console.error('Error fetching concept graph:', error);
+    next(error);
+  }
+}
+
+// Controller to force regenerate concept graph
+async function regenerateConceptGraph(req, res, next) {
+  const userId = req.user.id;
+  const docId = req.params.id;
+
+  try {
+    const docRes = await db.query(
+      'SELECT id, filename, status FROM documents WHERE id = $1 AND user_id = $2',
+      [docId, userId]
+    );
+
+    if (docRes.rows.length === 0) {
+      return res.status(404).json({ error: 'Document not found or unauthorized' });
+    }
+
+    const doc = docRes.rows[0];
+    if (doc.status !== 'processed') {
+      return res.status(400).json({ error: `Cannot regenerate concept graph for document in "${doc.status}" state.` });
+    }
+
+    const chunksRes = await db.query(
+      'SELECT page_number, content FROM document_chunks WHERE document_id = $1 ORDER BY page_number ASC',
+      [docId]
+    );
+
+    const graphData = await ai.generateConceptGraph(chunksRes.rows, doc.filename);
+
+    await db.query(
+      'UPDATE documents SET graph_data = $1 WHERE id = $2',
+      [JSON.stringify(graphData), docId]
+    );
+
+    return res.json({ graph: graphData, regenerated: true });
+
+  } catch (error) {
+    console.error('Error regenerating concept graph:', error);
     next(error);
   }
 }
@@ -254,5 +364,7 @@ module.exports = {
   uploadDocument,
   listDocuments,
   getDocument,
-  deleteDocument
+  deleteDocument,
+  getConceptGraph,
+  regenerateConceptGraph
 };

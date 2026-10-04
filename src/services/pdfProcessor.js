@@ -1,48 +1,63 @@
 const { spawn } = require('child_process');
 const path = require('path');
+const fs = require('fs');
 
 /**
- * Executes python text extraction script and returns structured text by page.
+ * Executes python text extraction script with PyMuPDF table detection,
+ * heading hierarchy analysis, text cleaning, and semantic chunking.
  * @param {string} pdfPath - Absolute path to the PDF file
- * @returns {Promise<Array<{page: number, text: string}>>}
+ * @returns {Promise<{
+ *   chunks: Array<{chunk_index: number, page: number, heading: string, section_path: string, content: string, content_type: string, tokens_est: number, summary_hint: string}>,
+ *   document_summary_hint: string,
+ *   total_chunks: number,
+ *   tables_detected: number,
+ *   pages_count: number
+ * }>}
  */
-function extractTextFromPdf(pdfPath) {
+function extractAndChunkPdf(pdfPath) {
   return new Promise((resolve, reject) => {
-    // Resolve absolute path to python script
+    const startTime = Date.now();
     const scriptPath = path.join(__dirname, '..', '..', 'scripts', 'extract_text.py');
 
-    // Use the virtual environment python executable if it exists
-    const fs = require('fs');
     const venvPythonPath = process.platform === 'win32'
       ? path.join(__dirname, '..', '..', 'venv', 'Scripts', 'python.exe')
       : path.join(__dirname, '..', '..', 'venv', 'bin', 'python');
     
     const pythonCommand = fs.existsSync(venvPythonPath) ? venvPythonPath : 'python';
 
-    // Spawn python process
-    const pythonProcess = spawn(pythonCommand, [scriptPath, pdfPath]);
+    const pythonProcess = spawn(pythonCommand, [scriptPath, pdfPath], {
+      env: { ...process.env, PYTHONIOENCODING: 'utf-8' }
+    });
 
     let stdoutData = '';
     let stderrData = '';
 
     pythonProcess.stdout.on('data', (data) => {
-      stdoutData += data.toString();
+      stdoutData += data.toString('utf-8');
     });
 
     pythonProcess.stderr.on('data', (data) => {
-      stderrData += data.toString();
+      stderrData += data.toString('utf-8');
     });
 
     pythonProcess.on('close', (code) => {
+      const elapsed = Date.now() - startTime;
       if (code !== 0) {
-        return reject(new Error(`Python extraction process exited with code ${code}. Error: ${stderrData}`));
+        return reject(new Error(`Python extraction process exited with code ${code} after ${elapsed}ms. Error: ${stderrData.trim()}`));
       }
 
       try {
-        const pages = JSON.parse(stdoutData);
-        resolve(pages);
+        const firstBrace = stdoutData.indexOf('{');
+        const lastBrace = stdoutData.lastIndexOf('}');
+        if (firstBrace === -1 || lastBrace === -1 || lastBrace < firstBrace) {
+          throw new Error('No valid JSON object found in Python extraction output');
+        }
+        const jsonStr = stdoutData.slice(firstBrace, lastBrace + 1);
+        const result = JSON.parse(jsonStr);
+        console.log(`[PDF Extraction] Completed in ${elapsed}ms: ${result.pages_count || 0} pages, ${result.total_chunks || 0} chunks, ${result.tables_detected || 0} tables.`);
+        resolve(result);
       } catch (parseError) {
-        reject(new Error(`Failed to parse Python script output: ${parseError.message}. Raw output: ${stdoutData}`));
+        reject(new Error(`Failed to parse Python extraction output (${parseError.message}). Raw output preview: ${stdoutData.slice(0, 300)}...`));
       }
     });
 
@@ -52,57 +67,6 @@ function extractTextFromPdf(pdfPath) {
   });
 }
 
-/**
- * Splits text into overlapping chunks.
- * @param {string} text - Input text string
- * @param {number} maxChunkSize - Max characters per chunk (default: 1000)
- * @param {number} overlap - Character overlap between chunks (default: 200)
- * @returns {Array<string>}
- */
-function chunkText(text, maxChunkSize = 1000, overlap = 200) {
-  if (!text || text.trim() === '') return [];
-
-  const chunks = [];
-  let startIndex = 0;
-
-  while (startIndex < text.length) {
-    let endIndex = startIndex + maxChunkSize;
-
-    // If we're not at the end of the text, try to break at a space or newline to keep words intact
-    if (endIndex < text.length) {
-      const lastSpace = text.lastIndexOf(' ', endIndex);
-      const lastNewline = text.lastIndexOf('\n', endIndex);
-      const bestBreak = Math.max(lastSpace, lastNewline);
-
-      // Avoid breaking too early if space/newline is far back (e.g. keep at least 70% of max size)
-      if (bestBreak > startIndex + (maxChunkSize * 0.7)) {
-        endIndex = bestBreak;
-      }
-    } else {
-      endIndex = text.length;
-    }
-
-    const chunk = text.substring(startIndex, endIndex).trim();
-    if (chunk.length > 0) {
-      chunks.push(chunk);
-    }
-
-    // If we reached the end of the text, we are done
-    if (endIndex >= text.length) {
-      break;
-    }
-
-    startIndex = endIndex - overlap;
-    // Safety check to prevent infinite loops
-    if (overlap >= maxChunkSize || startIndex >= endIndex) {
-      startIndex = endIndex;
-    }
-  }
-
-  return chunks;
-}
-
 module.exports = {
-  extractTextFromPdf,
-  chunkText
+  extractAndChunkPdf
 };
