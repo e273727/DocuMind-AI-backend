@@ -289,54 +289,125 @@ async function deleteDocument(req, res, next) {
 // Helper to enrich raw concept graph with hierarchy, summaries, and source evidence
 function enrichConceptGraph(graphData, chunks = [], filename = '') {
   if (!graphData || !graphData.nodes || graphData.nodes.length === 0) {
-    return graphData;
+    return { rootId: null, nodes: [], links: [] };
   }
 
-  const nodes = graphData.nodes;
-  const links = graphData.links || [];
+  const rawNodes = graphData.nodes;
+  const rawLinks = graphData.links || [];
 
-  // Calculate degrees to find root concept
-  const degreeMap = {};
-  nodes.forEach(n => { degreeMap[n.id] = 0; });
-  links.forEach(l => {
-    const sId = typeof l.source === 'object' ? l.source.id : l.source;
-    const tId = typeof l.target === 'object' ? l.target.id : l.target;
-    degreeMap[sId] = (degreeMap[sId] || 0) + 1;
-    degreeMap[tId] = (degreeMap[tId] || 0) + 1;
+  // 1. Build canonical ID lookup to handle minor LLM naming/casing variations
+  const canonicalMap = new Map();
+  const normalizeKey = (str) => String(str || '').trim().toLowerCase().replace(/[_\s-]+/g, ' ');
+
+  rawNodes.forEach(n => {
+    if (!n || !n.id) return;
+    const cleanId = String(n.id).trim();
+    canonicalMap.set(normalizeKey(cleanId), cleanId);
+    canonicalMap.set(cleanId.toLowerCase(), cleanId);
+    canonicalMap.set(cleanId, cleanId);
   });
 
-  // Pick root candidate: node matching filename keywords or highest degree
-  const cleanFilename = filename.replace(/\.pdf$/i, '').toLowerCase();
-  let rootId = nodes[0].id;
-  const nameMatch = nodes.find(n => cleanFilename.includes(n.id.toLowerCase()) || n.id.toLowerCase().includes('database') || n.id.toLowerCase().includes('operating'));
-  if (nameMatch) {
-    rootId = nameMatch.id;
-  } else {
-    let maxDeg = -1;
-    for (const n of nodes) {
-      if ((degreeMap[n.id] || 0) > maxDeg) {
-        maxDeg = degreeMap[n.id];
-        rootId = n.id;
+  // 2. Resolve and validate links
+  const validLinks = [];
+  const linkDedup = new Set();
+
+  rawLinks.forEach(l => {
+    const rawSource = typeof l.source === 'object' ? l.source.id : l.source;
+    const rawTarget = typeof l.target === 'object' ? l.target.id : l.target;
+    if (!rawSource || !rawTarget) return;
+
+    const sourceId = canonicalMap.get(normalizeKey(rawSource)) || canonicalMap.get(rawSource);
+    const targetId = canonicalMap.get(normalizeKey(rawTarget)) || canonicalMap.get(rawTarget);
+
+    if (sourceId && targetId && sourceId !== targetId) {
+      const rel = (l.relationship || 'relates to').trim().replace(/_/g, ' ');
+      const key = `${sourceId}:::${targetId}`;
+      if (!linkDedup.has(key)) {
+        linkDedup.add(key);
+        validLinks.push({
+          source: sourceId,
+          target: targetId,
+          relationship: rel
+        });
       }
     }
-  }
-
-  // Build undirected adjacency for BFS spanning tree
-  const adj = {};
-  nodes.forEach(n => { adj[n.id] = []; });
-  links.forEach(l => {
-    const sId = typeof l.source === 'object' ? l.source.id : l.source;
-    const tId = typeof l.target === 'object' ? l.target.id : l.target;
-    if (adj[sId]) adj[sId].push({ target: tId, relationship: l.relationship });
-    if (adj[tId]) adj[tId].push({ target: sId, relationship: l.relationship });
   });
 
-  // BFS to determine hierarchy levels & tree parent-child
+  // 3. Compute connectivity degrees (in, out, total)
+  const inDegree = {};
+  const outDegree = {};
+  const totalDegree = {};
+  rawNodes.forEach(n => {
+    inDegree[n.id] = 0;
+    outDegree[n.id] = 0;
+    totalDegree[n.id] = 0;
+  });
+
+  validLinks.forEach(l => {
+    outDegree[l.source] = (outDegree[l.source] || 0) + 1;
+    inDegree[l.target] = (inDegree[l.target] || 0) + 1;
+    totalDegree[l.source] = (totalDegree[l.source] || 0) + 1;
+    totalDegree[l.target] = (totalDegree[l.target] || 0) + 1;
+  });
+
+  // 4. Determine Root Concept
+  // Priority: (a) explicit is_root flag, (b) name matching filename keywords, (c) highest total degree
+  const cleanFilename = filename.replace(/\.pdf$/i, '').toLowerCase();
+  let rootId = null;
+
+  const explicitRoot = rawNodes.find(n => n.is_root);
+  if (explicitRoot) {
+    rootId = explicitRoot.id;
+  } else {
+    const nameMatch = rawNodes.find(n => cleanFilename.includes(n.id.toLowerCase()) || n.id.toLowerCase().includes(cleanFilename));
+    if (nameMatch) {
+      rootId = nameMatch.id;
+    } else {
+      let maxDeg = -1;
+      rawNodes.forEach(n => {
+        if ((totalDegree[n.id] || 0) > maxDeg) {
+          maxDeg = totalDegree[n.id];
+          rootId = n.id;
+        }
+      });
+    }
+  }
+  if (!rootId && rawNodes.length > 0) {
+    rootId = rawNodes[0].id;
+  }
+
+  // 5. Adjacency lists for graph traversal and rich relation tracking
+  const adj = {};
+  const detailedAdj = {};
+  rawNodes.forEach(n => {
+    adj[n.id] = [];
+    detailedAdj[n.id] = [];
+  });
+
+  validLinks.forEach(l => {
+    adj[l.source].push({ target: l.target, relationship: l.relationship });
+    adj[l.target].push({ target: l.source, relationship: l.relationship });
+
+    detailedAdj[l.source].push({
+      targetId: l.target,
+      targetTitle: l.target.replace(/_/g, ' '),
+      relationship: l.relationship,
+      direction: 'outgoing'
+    });
+    detailedAdj[l.target].push({
+      targetId: l.source,
+      targetTitle: l.source.replace(/_/g, ' '),
+      relationship: l.relationship,
+      direction: 'incoming'
+    });
+  });
+
+  // 6. BFS to build primary mind-map hierarchy tree
   const visited = new Set([rootId]);
   const levels = { [rootId]: 0 };
   const parentMap = { [rootId]: null };
   const treeChildren = {};
-  nodes.forEach(n => { treeChildren[n.id] = []; });
+  rawNodes.forEach(n => { treeChildren[n.id] = []; });
 
   const queue = [rootId];
   while (queue.length > 0) {
@@ -355,18 +426,104 @@ function enrichConceptGraph(graphData, chunks = [], filename = '') {
     }
   }
 
-  // Attach any disconnected nodes to root
-  for (const n of nodes) {
+  // 7. Ensure no orphans: link any disconnected nodes to root or closest category
+  for (const n of rawNodes) {
     if (!visited.has(n.id)) {
       visited.add(n.id);
       levels[n.id] = 1;
       parentMap[n.id] = rootId;
       treeChildren[rootId].push(n.id);
+
+      // Add synthetic relationship link
+      const fallbackRel = 'includes';
+      validLinks.push({
+        source: rootId,
+        target: n.id,
+        relationship: fallbackRel
+      });
+      detailedAdj[rootId].push({
+        targetId: n.id,
+        targetTitle: n.id.replace(/_/g, ' '),
+        relationship: fallbackRel,
+        direction: 'outgoing'
+      });
+      detailedAdj[n.id].push({
+        targetId: rootId,
+        targetTitle: rootId.replace(/_/g, ' '),
+        relationship: fallbackRel,
+        direction: 'incoming'
+      });
     }
   }
 
-  // Enrich each node with title, level, summary, and source references
-  const enrichedNodes = nodes.map(n => {
+  // 7b. Tree Balancing: If root has > 5 direct children, group them by category into a balanced 2-3 tier hierarchy
+  if ((treeChildren[rootId] || []).length > 5) {
+    const rawDirectChildren = [...treeChildren[rootId]];
+    const groupMap = new Map();
+
+    rawDirectChildren.forEach(childId => {
+      const childNode = rawNodes.find(n => n.id === childId);
+      const grp = (childNode?.group || 'Core Concepts').trim();
+      if (!groupMap.has(grp)) groupMap.set(grp, []);
+      groupMap.get(grp).push(childId);
+    });
+
+    if (groupMap.size >= 2) {
+      const newRootChildren = [];
+
+      groupMap.forEach((members, grp) => {
+        if (members.length <= 1) {
+          newRootChildren.push(members[0]);
+          return;
+        }
+
+        const normalize = s => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+        let pillarId = members.find(mId => {
+          const nm = normalize(mId);
+          const ng = normalize(grp);
+          return nm === ng || nm.includes(ng) || ng.includes(nm);
+        });
+
+        if (!pillarId) {
+          let maxDeg = -1;
+          members.forEach(mId => {
+            if ((totalDegree[mId] || 0) > maxDeg) {
+              maxDeg = totalDegree[mId];
+              pillarId = mId;
+            }
+          });
+        }
+
+        if (pillarId) {
+          newRootChildren.push(pillarId);
+          levels[pillarId] = 1;
+          parentMap[pillarId] = rootId;
+
+          const subMembers = members.filter(m => m !== pillarId);
+          treeChildren[pillarId] = Array.from(new Set([...(treeChildren[pillarId] || []), ...subMembers]));
+          subMembers.forEach(m => {
+            levels[m] = Math.max(levels[m] || 2, 2);
+            parentMap[m] = pillarId;
+            const existingRel = validLinks.find(l => (l.source === pillarId && l.target === m) || (l.source === m && l.target === pillarId));
+            if (!existingRel) {
+              validLinks.push({
+                source: pillarId,
+                target: m,
+                relationship: 'contains'
+              });
+            }
+          });
+        } else {
+          newRootChildren.push(...members);
+        }
+      });
+
+      treeChildren[rootId] = newRootChildren;
+    }
+  }
+
+  // 8. Enrich node metadata
+  const enrichedNodes = rawNodes.map(n => {
     const title = n.id.replace(/_/g, ' ');
     const rawLevel = levels[n.id] !== undefined ? levels[n.id] : 2;
     const level = Math.min(rawLevel, 3);
@@ -374,7 +531,6 @@ function enrichConceptGraph(graphData, chunks = [], filename = '') {
     // Search chunks for source references
     const matchingChunks = [];
     const searchTerms = [n.id.toLowerCase(), title.toLowerCase()];
-    
     if (chunks && chunks.length > 0) {
       for (const chunk of chunks) {
         const lower = (chunk.content || '').toLowerCase();
@@ -405,12 +561,6 @@ function enrichConceptGraph(graphData, chunks = [], filename = '') {
       }
     }
 
-    const related = (adj[n.id] || []).map(r => ({
-      targetId: r.target,
-      targetTitle: r.target.replace(/_/g, ' '),
-      relationship: r.relationship || 'relates to'
-    }));
-
     return {
       id: n.id,
       title,
@@ -421,18 +571,14 @@ function enrichConceptGraph(graphData, chunks = [], filename = '') {
       children: treeChildren[n.id] || [],
       summary,
       sourceReferences,
-      related
+      related: detailedAdj[n.id] || []
     };
   });
 
   return {
     rootId,
     nodes: enrichedNodes,
-    links: links.map(l => ({
-      source: typeof l.source === 'object' ? l.source.id : l.source,
-      target: typeof l.target === 'object' ? l.target.id : l.target,
-      relationship: l.relationship || 'relates to'
-    }))
+    links: validLinks
   };
 }
 
@@ -514,10 +660,40 @@ async function regenerateConceptGraph(req, res, next) {
       [JSON.stringify(graphData), docId]
     );
 
-    return res.json({ graph: graphData, regenerated: true });
+    const enriched = enrichConceptGraph(graphData, chunksRes.rows, doc.filename);
+    return res.json({ graph: enriched, regenerated: true });
 
   } catch (error) {
     console.error('Error regenerating concept graph:', error);
+    next(error);
+  }
+}
+
+// Controller to stream raw PDF file for in-browser viewing
+async function getDocumentPdf(req, res, next) {
+  const userId = req.user.id;
+  const docId = req.params.id;
+
+  try {
+    const docRes = await db.query(
+      'SELECT file_path, filename FROM documents WHERE id = $1 AND user_id = $2',
+      [docId, userId]
+    );
+
+    if (docRes.rows.length === 0) {
+      return res.status(404).json({ error: 'Document not found or unauthorized' });
+    }
+
+    const { file_path, filename } = docRes.rows[0];
+    if (!file_path || !fs.existsSync(file_path)) {
+      return res.status(404).json({ error: 'PDF file not found on disk' });
+    }
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename="${encodeURIComponent(filename)}"`);
+    fs.createReadStream(file_path).pipe(res);
+  } catch (error) {
+    console.error('Error streaming PDF:', error);
     next(error);
   }
 }
@@ -526,6 +702,7 @@ module.exports = {
   uploadDocument,
   listDocuments,
   getDocument,
+  getDocumentPdf,
   deleteDocument,
   getConceptGraph,
   regenerateConceptGraph

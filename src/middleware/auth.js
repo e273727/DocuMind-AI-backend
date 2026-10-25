@@ -5,8 +5,8 @@ const JWT_SECRET = process.env.JWT_SECRET || 'documind_secret_session_jwt_token_
 
 function authenticateToken(req, res, next) {
   const authHeader = req.headers['authorization'];
-  // Token usually comes as 'Bearer <token>'
-  const token = authHeader && authHeader.split(' ')[1];
+  // Token usually comes as 'Bearer <token>' or query parameter 'token'
+  const token = (authHeader && authHeader.split(' ')[1]) || req.query.token;
 
   if (!token) {
     return res.status(401).json({ error: 'Access token is required' });
@@ -14,7 +14,11 @@ function authenticateToken(req, res, next) {
 
   jwt.verify(token, JWT_SECRET, (err, user) => {
     if (err) {
-      return res.status(403).json({ error: 'Invalid or expired access token' });
+      const isExpired = err.name === 'TokenExpiredError';
+      return res.status(401).json({ 
+        error: isExpired ? 'Session expired. Please log in again.' : 'Invalid access token',
+        expired: isExpired 
+      });
     }
     
     // Store user info in request context

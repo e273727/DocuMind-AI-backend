@@ -17,6 +17,20 @@ app.use(cors());
 // Parse JSON request bodies
 app.use(express.json());
 
+// Lazy DB initialization for serverless / Vercel
+let dbInitialized = false;
+app.use(async (req, res, next) => {
+  if (!dbInitialized && (process.env.VERCEL || process.env.NODE_ENV === 'production')) {
+    try {
+      await initDatabase();
+      dbInitialized = true;
+    } catch (err) {
+      console.error('Serverless DB auto-init warning:', err.message);
+    }
+  }
+  next();
+});
+
 // API Routes
 app.use('/api/auth', authRoutes);
 app.use('/api/documents', documentRoutes);
@@ -35,20 +49,6 @@ app.get('/', (req, res) => {
     version: '1.0.0',
     documentation: '/health'
   });
-});
-
-// Lazy DB initialization for serverless / Vercel
-let dbInitialized = false;
-app.use(async (req, res, next) => {
-  if (!dbInitialized && (process.env.VERCEL || process.env.NODE_ENV === 'production')) {
-    try {
-      await initDatabase();
-      dbInitialized = true;
-    } catch (err) {
-      console.error('Serverless DB auto-init warning:', err.message);
-    }
-  }
-  next();
 });
 
 // Global Error Handler

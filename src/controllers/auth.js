@@ -4,6 +4,7 @@ const db = require('../config/db');
 require('dotenv').config();
 
 const JWT_SECRET = process.env.JWT_SECRET || 'documind_secret_session_jwt_token_2026';
+const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '24h';
 
 // Register a new user
 async function register(req, res, next) {
@@ -36,7 +37,7 @@ async function register(req, res, next) {
     const token = jwt.sign(
       { id: newUser.id, email: newUser.email },
       JWT_SECRET,
-      { expiresIn: '7d' } // token valid for 7 days
+      { expiresIn: JWT_EXPIRES_IN }
     );
 
     return res.status(201).json({
@@ -80,7 +81,7 @@ async function login(req, res, next) {
     const token = jwt.sign(
       { id: user.id, email: user.email },
       JWT_SECRET,
-      { expiresIn: '7d' }
+      { expiresIn: JWT_EXPIRES_IN }
     );
 
     return res.json({

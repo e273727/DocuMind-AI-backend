@@ -285,17 +285,57 @@ async function generateConceptGraph(chunks, filename) {
     return { nodes: [], links: [] };
   }
 
-  const sampledText = chunks.slice(0, 10).map(c => `[Page ${c.page_number}]: ${c.content.slice(0, 400)}`).join('\n\n');
+  // Sample up to 16 chunks distributed evenly across the entire document
+  const maxSamples = 16;
+  let sampledChunks = chunks;
+  if (chunks.length > maxSamples) {
+    const step = (chunks.length - 1) / (maxSamples - 1);
+    sampledChunks = [];
+    for (let i = 0; i < maxSamples; i++) {
+      sampledChunks.push(chunks[Math.round(i * step)]);
+    }
+  }
 
-  const systemPrompt = `You are a knowledge graph builder.
-Analyze the following document excerpts from "${filename}" and construct a concise concept graph of the key entities, concepts, topics, and relationships.
-Return RAW VALID JSON ONLY with no markdown wrapping. Format:
+  const sampledText = sampledChunks
+    .map(c => `[Page ${c.page_number}]: ${(c.content || '').slice(0, 600)}`)
+    .join('\n\n');
+
+  const systemPrompt = `You are an expert knowledge graph extraction engine.
+Analyze the document excerpts from "${filename}" and construct an interconnected, multi-level Concept Knowledge Graph representing the core concepts, methodologies, components, and their directional relationships.
+
+CRITICAL GRAPH CONSTRUCTION & HIERARCHY RULES:
+1. BALANCED 3-TIER TAXONOMY (AVOID FLAT STAR GRAPHS):
+   - DO NOT connect every concept directly to the Root! That creates an unreadable flat vertical list.
+   - LEVEL 0: Exactly ONE central Root node ("is_root": true) representing the main subject.
+   - LEVEL 1 (3 to 5 Primary Category Pillars): Only 3 to 5 broad category pillars or core subsystems connect directly to the Root (e.g., for Operating Systems: "Operating System Types", "Hardware Management", "Process Scheduling & Concurrency", "Core Principles & Abstractions").
+   - LEVEL 2 (Key Concepts & Components): 2 to 5 specific concepts branch from their respective Level 1 pillar (e.g., "CPU", "Memory", "GPU" branch from "Hardware Management").
+   - LEVEL 3 (Mechanisms & Metrics): Specific algorithms, metrics, or sub-mechanisms branch from Level 2 concepts (e.g., "Context Switching" branches from "Process Scheduling").
+   - CROSS-CUTTING RELATIONS: 5 to 10 meaningful associative links between concepts across different pillars.
+
+2. NODES (extract 14 to 22 concepts):
+   - "id": Clear, concise, standard title-cased name (e.g. "Hardware Management", "Batch-Processing OS", "Context Switching").
+   - "group": Topic category matching its Level 1 pillar (e.g. "Hardware", "Operating System Type", "Process Management", "Core Principle").
+   - "summary": A crisp 1-sentence definition of what this concept is and its role in the document.
+   - "is_root": true for the 1 central root concept, false for all others.
+
+3. RELATIONSHIPS & DIRECTIONALITY (extract 20 to 35 links):
+   - EVERY node must participate in at least one link. No disconnected or orphan concepts.
+   - DIRECTIONALITY: Every link MUST point purposefully from "source" to "target":
+     * "source": The parent pillar, prerequisite, owner, or active cause.
+     * "target": The child concept, sub-component, dependent, or effect.
+   - SPECIFIC ACTION PREDICATES: "relationship" must be a concise, active verb (1-3 words) (e.g., "categorized_as", "manages", "implements", "composed_of", "depends_on", "optimizes", "regulates", "executes").
+   - STRICT IDENTIFIER MATCHING: Every "source" and "target" in "links" MUST EXACTLY match the "id" string of a node defined in "nodes".
+
+Return RAW VALID JSON ONLY with no markdown code fences or backticks. Format:
 {
   "nodes": [
-    {"id": "ConceptName", "group": "TopicCategory", "val": 10}
+    {"id": "Operating System", "group": "Root", "summary": "Core system software managing computer hardware and software resources.", "is_root": true},
+    {"id": "Hardware Management", "group": "Hardware", "summary": "Subsystem responsible for abstracting and controlling physical computing hardware.", "is_root": false},
+    {"id": "CPU Scheduling", "group": "Process Management", "summary": "Mechanism determining which process runs on the CPU at any given time.", "is_root": false}
   ],
   "links": [
-    {"source": "ConceptName1", "target": "ConceptName2", "relationship": "relates_to"}
+    {"source": "Operating System", "target": "Hardware Management", "relationship": "encompasses"},
+    {"source": "Operating System", "target": "CPU Scheduling", "relationship": "coordinates"}
   ]
 }`;
 
@@ -315,11 +355,15 @@ Return RAW VALID JSON ONLY with no markdown wrapping. Format:
     if (rawText.startsWith('```')) {
       rawText = rawText.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '').trim();
     }
-    return JSON.parse(rawText);
+    const parsed = JSON.parse(rawText);
+    return {
+      nodes: Array.isArray(parsed.nodes) ? parsed.nodes : [],
+      links: Array.isArray(parsed.links) ? parsed.links : []
+    };
   } catch (err) {
     console.error('Error generating concept graph:', err);
     return {
-      nodes: [{ id: filename, group: "Document", val: 15 }],
+      nodes: [{ id: filename.replace(/\.pdf$/i, ''), group: "Document", summary: "Document core concept", is_root: true }],
       links: []
     };
   }
